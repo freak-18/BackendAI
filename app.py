@@ -1,3 +1,9 @@
+# --- CRITICAL FIX FOR DEPLOYMENT ---
+# eventlet.monkey_patch() must be the first line of code to be executed.
+# This patches the standard libraries to be compatible with eventlet's async model.
+import eventlet
+eventlet.monkey_patch()
+
 from flask import Flask, request, jsonify
 from flask_cors import CORS
 from flask_socketio import SocketIO
@@ -9,10 +15,6 @@ import requests
 import pytesseract
 from PIL import Image
 from dotenv import load_dotenv
-import eventlet # Required for Gunicorn deployment on Render
-
-# Ensure eventlet is used for async operations
-eventlet.monkey_patch()
 
 load_dotenv()
 
@@ -43,11 +45,9 @@ except FileNotFoundError:
 # In-memory store for chat history (will reset if the server restarts)
 chat_memory = {}
 
-# --- CORRECTED ROOT ROUTE ---
-# This route now acts as a simple health check for the API.
-# It no longer causes the "TemplateNotFound" error.
 @app.route("/")
 def health_check():
+    # This route acts as a simple health check for the API.
     return jsonify({"status": "Ben AI Backend is running successfully"}), 200
 
 @app.route("/upload", methods=["POST"])
@@ -96,6 +96,54 @@ def handle_connect():
 def handle_disconnect():
     print(f"Client disconnected: {request.sid}")
 
+def stream_response_task(sid, user_id, messages, user_message):
+    """ The actual task that streams the response. """
+    try:
+        response = requests.post(
+            GROQ_ENDPOINT,
+            headers={
+                "Authorization": f"Bearer {GROQ_API_KEY}",
+                "Content-Type": "application/json"
+            },
+            json={
+                "model": "llama3-8b-8192",
+                "messages": messages,
+                "stream": True
+            },
+            stream=True,
+            timeout=60
+        )
+        response.raise_for_status()
+
+        full_response = ""
+        for line in response.iter_lines():
+            if line and line.startswith(b"data:"):
+                try:
+                    data_str = line.decode("utf-8")[6:]
+                    if data_str.strip() == "[DONE]":
+                        break
+                    parsed = json.loads(data_str)
+                    content = parsed["choices"][0]["delta"].get("content", "")
+                    if content:
+                        full_response += content
+                        socketio.emit("reply", {"token": content}, room=sid)
+                except json.JSONDecodeError:
+                    continue
+        
+        # Update server-side memory with the full conversation turn
+        if user_id in chat_memory:
+            chat_memory[user_id].append({"role": "user", "content": user_message})
+            chat_memory[user_id].append({"role": "assistant", "content": full_response})
+        
+        socketio.emit("end", {}, room=sid)
+
+    except requests.exceptions.RequestException as e:
+        print(f"API Request Error: {e}")
+        socketio.emit("error", {"message": f"Could not connect to Groq API: {e}"}, room=sid)
+    except Exception as e:
+        print(f"An unexpected error occurred: {e}")
+        socketio.emit("error", {"message": str(e)}, room=sid)
+
 @socketio.on("chat")
 def handle_chat(data):
     user_id = data.get("user_id", "default")
@@ -106,56 +154,17 @@ def handle_chat(data):
     if user_id not in chat_memory:
         chat_memory[user_id] = [{"role": "system", "content": SYSTEM_PROMPT}]
     
-    # Combine system prompt, client-sent history, and the new message
     messages_to_send = [chat_memory[user_id][0]] + history
     messages_to_send.append({"role": "user", "content": user_message})
 
-    def stream_response(sid, user_id, messages):
-        try:
-            response = requests.post(
-                GROQ_ENDPOINT,
-                headers={
-                    "Authorization": f"Bearer {GROQ_API_KEY}",
-                    "Content-Type": "application/json"
-                },
-                json={
-                    "model": "llama3-8b-8192",
-                    "messages": messages,
-                    "stream": True
-                },
-                stream=True,
-                timeout=60
-            )
-            response.raise_for_status() # Raise an exception for bad status codes
-
-            full_response = ""
-            for line in response.iter_lines():
-                if line and line.startswith(b"data:"):
-                    try:
-                        data_str = line.decode("utf-8")[6:]
-                        if data_str.strip() == "[DONE]":
-                            break
-                        parsed = json.loads(data_str)
-                        content = parsed["choices"][0]["delta"].get("content", "")
-                        if content:
-                            full_response += content
-                            socketio.emit("reply", {"token": content}, room=sid)
-                    except json.JSONDecodeError:
-                        continue # Ignore empty or malformed lines
-            
-            # Update server-side memory with the full conversation turn
-            chat_memory[user_id].append({"role": "user", "content": user_message})
-            chat_memory[user_id].append({"role": "assistant", "content": full_response})
-            socketio.emit("end", {}, room=sid)
-
-        except requests.exceptions.RequestException as e:
-            print(f"API Request Error: {e}")
-            socketio.emit("error", {"message": f"Could not connect to Groq API: {e}"}, room=sid)
-        except Exception as e:
-            print(f"An unexpected error occurred: {e}")
-            socketio.emit("error", {"message": str(e)}, room=sid)
-
-    socketio.start_background_task(stream_response, sid, user_id, messages_to_send)
+    # Use socketio.start_background_task to run the streaming function
+    socketio.start_background_task(
+        stream_response_task, 
+        sid=sid, 
+        user_id=user_id, 
+        messages=messages_to_send,
+        user_message=user_message
+    )
 
 if __name__ == "__main__":
     # This block is for local development only
