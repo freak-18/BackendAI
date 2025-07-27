@@ -1,3 +1,11 @@
 flask
+flask-cors
+flask-socketio
+flask-session
+python-dotenv
 gunicorn
-python-dotenv 
+eventlet
+requests
+PyMuPDF
+pytesseract
+pillow
