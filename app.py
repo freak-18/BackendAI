@@ -1,8 +1,6 @@
-from flask import Flask, request, jsonify, render_template
+from flask import Flask, request, jsonify
 from flask_cors import CORS
 from flask_socketio import SocketIO
-from flask_session import Session
-from concurrent.futures import ThreadPoolExecutor
 from werkzeug.utils import secure_filename
 import fitz  # PyMuPDF
 import os
@@ -10,58 +8,75 @@ import json
 import requests
 import pytesseract
 from PIL import Image
-import tempfile
 from dotenv import load_dotenv
+import eventlet # Required for Gunicorn deployment on Render
+
+# Ensure eventlet is used for async operations
+eventlet.monkey_patch()
+
 load_dotenv()
-import os
 
 # App setup
-app = Flask(__name__, static_folder="static", template_folder="templates")
-app.secret_key = "nova_secret"
-app.config["SESSION_TYPE"] = "filesystem"
-Session(app)
+app = Flask(__name__)
 CORS(app, supports_credentials=True)
-socketio = SocketIO(app, cors_allowed_origins="*", async_mode="threading")
-executor = ThreadPoolExecutor()
+# Use async_mode='eventlet' for compatibility with the Render start command
+socketio = SocketIO(app, cors_allowed_origins="*", async_mode='eventlet')
 
 # Upload folder
-UPLOAD_FOLDER = "./pdfs"
+UPLOAD_FOLDER = "/tmp/uploads" # Use a temporary directory for uploads on Render
 os.makedirs(UPLOAD_FOLDER, exist_ok=True)
 
 # Groq API setup
 GROQ_API_KEY = os.getenv("GROQ_API_KEY")
+if not GROQ_API_KEY:
+    print("FATAL ERROR: GROQ_API_KEY is not set in environment variables.")
 GROQ_ENDPOINT = "https://api.groq.com/openai/v1/chat/completions"
 
 # Load system prompt
-with open("prompt.txt", "r", encoding="utf-8") as f:
-    SYSTEM_PROMPT = f.read()
+try:
+    with open("prompt.txt", "r", encoding="utf-8") as f:
+        SYSTEM_PROMPT = f.read()
+except FileNotFoundError:
+    SYSTEM_PROMPT = "You are a helpful assistant."
+    print("Warning: prompt.txt not found. Using a default system prompt.")
 
-# Memory per user session
+# In-memory store for chat history (will reset if the server restarts)
 chat_memory = {}
 
+# --- CORRECTED ROOT ROUTE ---
+# This route now acts as a simple health check for the API.
+# It no longer causes the "TemplateNotFound" error.
 @app.route("/")
-def index():
-    return render_template("index.html")
+def health_check():
+    return jsonify({"status": "Ben AI Backend is running successfully"}), 200
 
 @app.route("/upload", methods=["POST"])
 def upload_file():
     if 'file' not in request.files:
-        return jsonify({"success": False, "error": "No file uploaded"})
+        return jsonify({"success": False, "error": "No file part in request"}), 400
 
     file = request.files['file']
+    if file.filename == '':
+        return jsonify({"success": False, "error": "No selected file"}), 400
+
     filename = secure_filename(file.filename)
     ext = filename.lower().split(".")[-1]
     save_path = os.path.join(UPLOAD_FOLDER, filename)
     file.save(save_path)
 
-    if ext == "pdf":
-        text = extract_text_from_pdf(save_path)
-    elif ext in ["jpg", "jpeg", "png"]:
-        text = extract_text_from_image(save_path)
-    else:
-        return jsonify({"success": False, "error": "Unsupported file type"})
+    try:
+        if ext == "pdf":
+            text = extract_text_from_pdf(save_path)
+        elif ext in ["jpg", "jpeg", "png"]:
+            text = extract_text_from_image(save_path)
+        else:
+            return jsonify({"success": False, "error": "Unsupported file type"}), 400
+        return jsonify({"success": True, "text": text[:5000]})
+    finally:
+        # Clean up the uploaded file after processing
+        if os.path.exists(save_path):
+            os.remove(save_path)
 
-    return jsonify({"success": True, "text": text[:5000]})
 
 def extract_text_from_pdf(path):
     text = ""
@@ -73,17 +88,29 @@ def extract_text_from_pdf(path):
 def extract_text_from_image(path):
     return pytesseract.image_to_string(Image.open(path))
 
+@socketio.on("connect")
+def handle_connect():
+    print(f"Client connected: {request.sid}")
+
+@socketio.on("disconnect")
+def handle_disconnect():
+    print(f"Client disconnected: {request.sid}")
+
 @socketio.on("chat")
 def handle_chat(data):
     user_id = data.get("user_id", "default")
     user_message = data.get("message", "")
+    history = data.get("memory", [])
     sid = request.sid
 
     if user_id not in chat_memory:
         chat_memory[user_id] = [{"role": "system", "content": SYSTEM_PROMPT}]
-    chat_memory[user_id].append({"role": "user", "content": user_message})
+    
+    # Combine system prompt, client-sent history, and the new message
+    messages_to_send = [chat_memory[user_id][0]] + history
+    messages_to_send.append({"role": "user", "content": user_message})
 
-    def stream_response(sid, user_id):
+    def stream_response(sid, user_id, messages):
         try:
             response = requests.post(
                 GROQ_ENDPOINT,
@@ -93,37 +120,43 @@ def handle_chat(data):
                 },
                 json={
                     "model": "llama3-8b-8192",
-                    "messages": chat_memory[user_id],
+                    "messages": messages,
                     "stream": True
                 },
                 stream=True,
                 timeout=60
             )
+            response.raise_for_status() # Raise an exception for bad status codes
 
-            partial = ""
+            full_response = ""
             for line in response.iter_lines():
-                if line and b"data:" in line:
+                if line and line.startswith(b"data:"):
                     try:
-                        data = line.decode("utf-8").split("data: ")[-1]
-                        if data.strip() == "[DONE]":
+                        data_str = line.decode("utf-8")[6:]
+                        if data_str.strip() == "[DONE]":
                             break
-                        parsed = json.loads(data)
+                        parsed = json.loads(data_str)
                         content = parsed["choices"][0]["delta"].get("content", "")
                         if content:
-                            partial += content
+                            full_response += content
                             socketio.emit("reply", {"token": content}, room=sid)
                     except json.JSONDecodeError:
-                        continue
-                    except Exception:
-                        continue
+                        continue # Ignore empty or malformed lines
             
-            chat_memory[user_id].append({"role": "assistant", "content": partial})
+            # Update server-side memory with the full conversation turn
+            chat_memory[user_id].append({"role": "user", "content": user_message})
+            chat_memory[user_id].append({"role": "assistant", "content": full_response})
             socketio.emit("end", {}, room=sid)
 
+        except requests.exceptions.RequestException as e:
+            print(f"API Request Error: {e}")
+            socketio.emit("error", {"message": f"Could not connect to Groq API: {e}"}, room=sid)
         except Exception as e:
+            print(f"An unexpected error occurred: {e}")
             socketio.emit("error", {"message": str(e)}, room=sid)
 
-    socketio.start_background_task(stream_response, sid, user_id)
+    socketio.start_background_task(stream_response, sid, user_id, messages_to_send)
 
 if __name__ == "__main__":
+    # This block is for local development only
     socketio.run(app, host="0.0.0.0", port=5000, debug=True)
