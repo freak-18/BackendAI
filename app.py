@@ -11,6 +11,9 @@ import requests
 import pytesseract
 from PIL import Image
 import tempfile
+from dotenv import load_dotenv
+load_dotenv()
+import os
 
 # App setup
 app = Flask(__name__, static_folder="static", template_folder="templates")
@@ -26,7 +29,7 @@ UPLOAD_FOLDER = "./pdfs"
 os.makedirs(UPLOAD_FOLDER, exist_ok=True)
 
 # Groq API setup
-GROQ_API_KEY = "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"
+GROQ_API_KEY = os.getenv("GROQ_API_KEY")
 GROQ_ENDPOINT = "https://api.groq.com/openai/v1/chat/completions"
 
 # Load system prompt
