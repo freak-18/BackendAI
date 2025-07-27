@@ -105,14 +105,18 @@ def handle_chat(data):
                 if line and b"data:" in line:
                     try:
                         data = line.decode("utf-8").split("data: ")[-1]
+                        if data.strip() == "[DONE]":
+                            break
                         parsed = json.loads(data)
                         content = parsed["choices"][0]["delta"].get("content", "")
                         if content:
                             partial += content
                             socketio.emit("reply", {"token": content}, room=sid)
+                    except json.JSONDecodeError:
+                        continue
                     except Exception:
                         continue
-
+            
             chat_memory[user_id].append({"role": "assistant", "content": partial})
             socketio.emit("end", {}, room=sid)
 
